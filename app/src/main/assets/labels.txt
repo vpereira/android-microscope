@@ -1,0 +1,13 @@
+Resistor
+Capacitor
+Electrolytic Capacitor
+IC
+Inductor
+Diode
+LED
+Transistor
+Oscillator
+Connector
+Switch/Button
+Other
+Marker

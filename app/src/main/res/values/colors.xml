@@ -1,0 +1,8 @@
+<resources>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="accent">#FF00E5FF</color>
+    <color name="panel">#99000000</color>
+    <color name="box">#FFFF3D00</color>
+    <color name="ic_launcher_background">#FF0A0A0A</color>
+</resources>
