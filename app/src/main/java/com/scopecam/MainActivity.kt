@@ -4,17 +4,24 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
+import android.view.View
 import android.widget.SeekBar
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.AspectRatio
@@ -40,11 +47,30 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private var camera: Camera? = null
     private var detector: Detector? = null
 
-    private var yoloEnabled = false
+    @Volatile private var yoloEnabled = false
     private var autoFocus = true
     private var minFocusDistance = 0f   // diopters; 0 means unknown/fixed-focus
     private var maxZoom = 1f
     private var minZoom = 1f
+
+    // Latest lens focus distance reported by the camera (diopters), updated every frame.
+    // Lets us seed the manual slider from wherever autofocus last settled.
+    @Volatile private var currentFocusDistance = 0f
+
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val hideControlsRunnable = Runnable { hideControls() }
+
+    // Reads the actual focus distance from each capture result so manual mode
+    // can continue from the autofocus position instead of jumping.
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { currentFocusDistance = it }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -53,9 +79,36 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
 
         cameraExecutor = Executors.newSingleThreadExecutor()
         bindControls()
+        showControls()
 
         if (allPermissionsGranted()) startCamera()
         else ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
+    }
+
+    // Any touch reveals the controls and restarts the hide timer, so the preview
+    // stays unobstructed while working and the controls are one tap away.
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.action == MotionEvent.ACTION_DOWN) showControls()
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private val fadingViews get() = listOf<View>(binding.panel, binding.readout)
+
+    private fun showControls() {
+        uiHandler.removeCallbacks(hideControlsRunnable)
+        fadingViews.forEach { v ->
+            v.animate().cancel()
+            v.visibility = View.VISIBLE
+            v.animate().alpha(1f).setDuration(150).start()
+        }
+        uiHandler.postDelayed(hideControlsRunnable, CONTROLS_HIDE_DELAY)
+    }
+
+    private fun hideControls() {
+        fadingViews.forEach { v ->
+            v.animate().alpha(0f).setDuration(400)
+                .withEndAction { v.visibility = View.INVISIBLE }.start()
+        }
     }
 
     private fun bindControls() {
@@ -66,6 +119,12 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         binding.btnAutoFocus.setOnCheckedChangeListener { _, isChecked ->
             autoFocus = isChecked
             binding.seekFocus.isEnabled = !isChecked
+            // Switching to manual: start the slider from where autofocus last settled,
+            // so the image does not jump and the user only fine-tunes from there.
+            if (!isChecked && minFocusDistance > 0f) {
+                val frac = (currentFocusDistance / minFocusDistance).coerceIn(0f, 1f)
+                binding.seekFocus.progress = (frac * 100).toInt()
+            }
             applyFocus()
         }
 
@@ -184,11 +243,12 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             .requireLensFacing(CameraSelector.LENS_FACING_BACK)
             .build()
 
-        val preview = Preview.Builder()
+        val previewBuilder = Preview.Builder()
             .setTargetAspectRatio(AspectRatio.RATIO_4_3)
-            .build().also {
-                it.setSurfaceProvider(binding.viewFinder.surfaceProvider)
-            }
+        Camera2Interop.Extender(previewBuilder).setSessionCaptureCallback(captureCallback)
+        val preview = previewBuilder.build().also {
+            it.setSurfaceProvider(binding.viewFinder.surfaceProvider)
+        }
 
         val analyzer = ImageAnalysis.Builder()
             .setTargetAspectRatio(AspectRatio.RATIO_4_3)
@@ -235,6 +295,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
 
     override fun onDestroy() {
         super.onDestroy()
+        uiHandler.removeCallbacks(hideControlsRunnable)
         detector?.close()
         cameraExecutor.shutdown()
     }
@@ -242,6 +303,12 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     override fun onEmptyDetect() = runOnUiThread { binding.overlay.clear() }
 
     override fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long) = runOnUiThread {
+        // A detection may finish right after YOLO is toggled off; drop it so stale
+        // boxes/labels never linger over the board while soldering.
+        if (!yoloEnabled) {
+            binding.overlay.clear()
+            return@runOnUiThread
+        }
         lastInference = inferenceTime
         binding.overlay.setResults(boundingBoxes)
         updateReadout()
@@ -251,6 +318,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         private const val TAG = "ScopeCam"
         private const val MODEL_PATH = "model.tflite"
         private const val LABELS_PATH = "labels.txt"
+        private const val CONTROLS_HIDE_DELAY = 3500L
         private const val REQUEST_CODE_PERMISSIONS = 10
         private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
     }
